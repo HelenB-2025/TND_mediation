@@ -1,0 +1,663 @@
+
+
+#TND data should be prepared as: only contain TND sample and only contain id variable, outcome variable, 
+#treatment variable, mediator variable, control indicator variable and all the confounder to be adjusted.
+
+#Parameters used in the function:
+  #data: name of dataset
+  #id: variable name for ID, if there is multiple observations from one individual.
+  #control.ind: indicator variable name for TND control with indicator=1 or case with indicator=0, e.g.control.ind=C.
+  #mediator: variable name of the mediator which must be a binary variable, e.g, mediator=Mediator.
+  #trt: variable name of mediator which must be a binary variable, e.g, trt=Vaccine.
+  #outcome: variable name of outcome which must be a binary variable, e.g, outcome=Y.
+  #model.out: specify outcome model e.g.model.out="Y~M+V+L1+L2+L3+as.factor(L4)".
+  #model.med: specify mediator model e.g.model.med="M~V+L1+L2+L3+as.factor(L4)".
+  #model.ps: specify propensity score model e.g.model.ps="V~L1+L2+L3+as.factor(L4)".
+
+#[IMPORTANT!] fix.val: specify confounder values for prediction, the order should follow the order of confounder,
+  #listed in the input dataset, rather than the order listed in the model. 
+  #If NULL, the mean values of continuous confounder and mode of categorical variable will be used.  e.g.,fix.val=c(1,0,1,"Low") 
+  #boots: specify the number of iteration for bootstrap variance estimate.
+
+
+library(Matrix)
+library(dplyr)
+library(LaplacesDemon)
+
+
+#################Function#####################
+set.seed(100)
+med.est<-function(data,id,control.ind,mediator,trt,outcome,model.out,model.med,model.ps,fix.val=NULL,boots=0){
+  
+  #rename variables
+  names(data)[names(data) == outcome] <- "Y"
+  names(data)[names(data) == trt] <- "V"
+  names(data)[names(data) == mediator] <- "M"
+  names(data)[names(data) == control.ind] <- "C"
+  names(data)[names(data) == id] <- "id"
+  
+  #extract categorical variables
+  extract_factor_vars <- function(formula_obj) {
+    # Convert formula to character
+    form_char <- paste(deparse(formula_obj), collapse = "")
+    
+    # Find matches
+    m <- gregexpr("as\\.factor\\s*\\(([^)]+)\\)", form_char)
+    matches <- regmatches(form_char, m)[[1]]
+    
+    # Extract variable names
+    vars <- sub("as\\.factor\\s*\\(([^)]+)\\)", "\\1", matches)
+    return(vars)
+  }
+  
+  factor.out<-extract_factor_vars(model.out)
+  factor.med<-extract_factor_vars(model.med)
+  factor.ps<-extract_factor_vars(model.ps)
+  
+  #factorize the variables in the data
+  factorize_from_formula <- function(data, formula_obj) {
+    vars <- extract_factor_vars(formula_obj)
+    for (v in vars) {
+      if (v %in% names(data)) {
+        data[[v]] <- factor(data[[v]])
+      } else {
+        warning(paste("Variable", v, "not found in data"))
+      }
+    }
+    data[["id"]] <- NULL
+    return(data)
+  }
+  
+  dat.out<-factorize_from_formula(data,model.out)
+  dat.med<-extract_factor_vars(model.med)
+  dat.ps<-extract_factor_vars(model.ps)
+  
+  #factor categorical variable and set the default value to its mode
+  add_factor_columns_mode <- function(newdat, data, factor_vars) {
+    for (v in factor_vars) {
+      if (v %in% names(data)) {
+        x <- factor(data[[v]])
+        levs <- levels(x)
+        
+        if (all(is.na(x))) {
+          mode_value <- NA_character_
+        } else {
+          counts <- table(x)
+          mode_value <- names(counts)[which.max(counts)]
+        }
+        
+        newdat[[v]] <- factor(
+          rep(mode_value, nrow(newdat)),
+          levels = levs
+        )
+      } else {
+        warning(paste("Variable", v, "not found in data"))
+      }
+    }
+    
+    return(newdat)
+  }
+  
+  #whether to calculate conditional effects for pre-specified confounder values
+  if(is.null(fix.val)){
+    #assign mean values to continuous confounder
+    vars <- names(dplyr::select(data, !c(C,V,M,Y,id)&!factor.out))
+    mean_values <- colMeans(data[, vars], na.rm = TRUE)
+    var_value <- as.data.frame(t(mean_values)) 
+    newdat <- add_factor_columns_mode(var_value, data, factor.out)
+  }else{
+    #assign pre-specified values to each confounder
+    vars.all <- names(dplyr::select(data, !c(C,V,M,Y,id)))
+    var_value <-as.data.frame(as.list(setNames(fix.val, vars.all)))
+    #for (v in factor.out) {
+    #  var_value[[v]] <- factor(
+    #    as.character(var_value[[v]]),
+    #    levels = levels(data[[v]]))
+    #}
+    # variables that should be numeric (all except factor variables)
+    num_vars <- setdiff(names(var_value), factor.out)
+    # convert them to numeric
+    var_value[num_vars] <- lapply(var_value[num_vars], function(x) as.numeric(as.character(x)))
+    newdat<-var_value
+  }
+  
+  
+  #######TND Estimators#########
+  #cNDE
+  #logistic regression for outcome model P(Y=1|M,V,L,W)
+  outcome.formula <- as.formula(model.out)
+  out.model<-glm(outcome.formula,data=data,family="binomial"(link = "logit"))
+  pred1<-predict(out.model,newdata=data.frame(V=1,M=1,newdat),type="response")
+  pred0<-predict(out.model,newdata=data.frame(V=0,M=1,newdat),type="response")
+  cNDE<-pred1/pred0
+    
+  #cNIE
+  #logistic regression for mediator model P(M=1|V,L,W)
+  mediator.model<-glm(model.med,data=data,family="binomial"(link = "logit"))
+  mpred1<-predict(mediator.model,newdata=data.frame(V=1,newdat),type="response")
+  mpred0<-predict(mediator.model,newdata=data.frame(V=0,newdat),type="response")
+  cNIE.TND<-mpred1/mpred0
+  #ps ratio
+  ps.model<-glm(model.ps,data=data,family="binomial"(link = "logit"))
+  vpred<-predict(ps.model,newdata=newdat,type="response")
+  ratio.ps<-vpred/(1-vpred)
+  #control
+  TND.c<-subset(data,data$C==1)
+  ps.c.model<-glm(model.ps,data=TND.c,family="binomial"(link = "logit"))
+  ps.c.pred<-predict(ps.c.model,newdata=newdat,type="response")
+  ratio.ps.c<-ps.c.pred/(1-ps.c.pred)
+  cNIE<-cNIE.TND*ratio.ps/ratio.ps.c
+  
+  #cTE
+  cTE<-cNIE*cNDE
+  
+  #cCDE on OR
+  cCDE<-(pred1/(1-pred1))/(pred0/(1-pred0))
+  
+  #bootstrap variance
+  cNDE.var<-rep(0,boots);cNIE.var<-rep(0,boots);cTE.var<-rep(0,boots);cCDE.var<-rep(0,boots)
+  
+  for (j in 1:boots){
+    sample_id<-sample(unique(data$id),length(unique(data$id)),replace=TRUE)
+    s.dat <- data[
+      data$id %in% sample_id,
+      ,
+      drop = FALSE
+    ]
+    #cNDE
+    #logistic regression for outcome model P(Y=1|M,V,L,W)
+    outcome.formula <- as.formula(model.out)
+    out.model<-glm(outcome.formula,data=s.dat,family="binomial"(link = "logit"))
+    pred1<-predict(out.model,newdata=data.frame(V=1,M=1,newdat),type="response")
+    pred0<-predict(out.model,newdata=data.frame(V=0,M=1,newdat),type="response")
+    cNDE.var[j]<-pred1/pred0
+    
+    #cNIE
+    #logistic regression for mediator model P(M=1|V,L,W)
+    mediator.model<-glm(model.med,data=s.dat,family="binomial"(link = "logit"))
+    mpred1<-predict(mediator.model,newdata=data.frame(V=1,newdat),type="response")
+    mpred0<-predict(mediator.model,newdata=data.frame(V=0,newdat),type="response")
+    cNIE.TND<-mpred1/mpred0
+    #ps ratio
+    ps.model<-glm(model.ps,data=s.dat,family="binomial"(link = "logit"))
+    vpred<-predict(ps.model,newdata=newdat,type="response")
+    ratio.ps<-vpred/(1-vpred)
+    #control
+    TND.c<-subset(s.dat,s.dat$C==1)
+    ps.c.model<-glm(model.ps,data=TND.c,family="binomial"(link = "logit"))
+    ps.c.pred<-predict(ps.c.model,newdata=newdat,type="response")
+    ratio.ps.c<-ps.c.pred/(1-ps.c.pred)
+    cNIE.var[j]<-cNIE.TND*ratio.ps/ratio.ps.c
+    
+    #cTE
+    cTE.var[j]<-cNIE.var[j]*cNDE.var[j]
+    
+    #cCDE on OR
+    cCDE.var[j]<-(pred1/(1-pred1))/(pred0/(1-pred0))
+  } 
+  
+  boots.cNDE<-var(cNDE.var)
+  boots.cNIE<-var(cNIE.var)
+  boots.cTE<-var(cTE.var)
+  boots.cCDE<-var(cCDE.var)
+  #bootstrap 95% percentile
+  cNDE.l<-quantile(cNDE.var, probs = 0.025);cNDE.u<-quantile(cNDE.var, probs = 0.975)
+  cNIE.l<-quantile(cNIE.var, probs = 0.025);cNIE.u<-quantile(cNIE.var, probs = 0.975)
+  cTE.l<-quantile(cTE.var, probs = 0.025);cTE.u<-quantile(cTE.var, probs = 0.975)
+  cCDE.l<-quantile(cCDE.var, probs = 0.025);cCDE.u<-quantile(cCDE.var, probs = 0.975)
+  
+  #sandwich variance
+  #cNDE
+  cNDE.sand <- cNDE_sandwich(data,model.out,model.med,newdat)
+  
+  cNIE.sand <- cNIE_sandwich(data,model.out,model.med,model.ps,newdat)
+  
+  cTE.sand <- cTE_sandwich(data,model.out,model.med,model.ps,newdat)
+  
+  out<-list("cNDE"=cNDE,"cNIE"=cNIE,"cTE"=cTE,"cCDE"=cCDE,
+            "boots.cNDE"=boots.cNDE,"boots.cNIE"=boots.cNIE,"boots.cTE"=boots.cTE,"boots.cCDE"=boots.cCDE,
+            "sand.cNDE"=cNDE.sand$var_lambda,"sand.cNIE"=cNIE.sand$var_lambda2,
+            "sand.cTE"=cTE.sand$var_cTE,
+            "cNDE.l"=cNDE.l,"cNDE.u"=cNDE.u,
+            "cNIE.l"=cNIE.l,"cNIE.u"=cNIE.u,
+            "cTE.l"=cTE.l,"cTE.u"=cTE.u,
+            "cCDE.l"=cCDE.l,"cCDE.u"=cCDE.u,"value"=newdat)
+  return(out)
+}
+
+
+
+
+#########sandwich estimator function##########
+###cNDE
+expit <- function(x) 1/(1 + exp(-x))
+
+cNDE_sandwich <- function(data,model.out,model.med,newdata) {
+  
+  # 1) Fit logistic model
+  fit <- glm(as.formula(model.out), family = binomial(), data = data)
+  alpha_hat <- coef(fit)
+  
+  # --- KEY FIX: use RHS-only terms for newdata matrices ---
+  trm_full <- terms(fit)                 # includes response
+  trm_rhs  <- delete.response(trm_full)  # RHS only
+  rhs_vars <- all.vars(trm_rhs)
+  xlev     <- fit$xlevels
+  
+  newdata<-as.data.frame(newdata) 
+  newdata$M<-1
+  newdata$V<-0
+  
+  # create nd1 (V=1) and nd0 (V=0)
+  nd1 <- newdata
+  nd0 <- newdata
+  nd1$V <- 1
+  nd0$V <- 0
+  
+  # model matrices for the two design vectors
+  mf1 <- model.frame(trm_rhs, data = nd1, xlev = xlev, na.action = na.pass)
+  mf0 <- model.frame(trm_rhs, data = nd0, xlev = xlev, na.action = na.pass)
+  x1  <- model.matrix(trm_rhs, data = mf1)
+  x0  <- model.matrix(trm_rhs, data = mf0)
+  
+  # 4) lambda_hat
+  eta1 <- drop(x1 %*% alpha_hat)
+  eta0 <- drop(x0 %*% alpha_hat)
+  p1 <- expit(eta1)
+  p0 <- expit(eta0)
+  lambda_hat <- as.numeric(p1 / p0)
+  
+  # 5) gradient d lambda / d alpha
+  dp1 <- as.numeric(p1 * (1 - p1)) * as.numeric(x1)
+  dp0 <- as.numeric(p0 * (1 - p0)) * as.numeric(x0)
+  grad <- (dp1 / p0) - (p1 / (p0^2)) * dp0
+  
+  #######################################
+  n <- nrow(data)
+  # 2) Sandwich variance for alpha_hat
+  #V_alpha<-sandwich::vcovHC(fit, type = vcov_type)
+  mf_rhs  <- model.frame(trm_rhs, data = data, xlev = fit$xlevels, na.action = na.pass)
+  X1 <- model.matrix(trm_rhs, data = mf_rhs)
+  Y  <- model.response(model.frame(fit, data = data, na.action = na.pass))
+  
+  # 3) Predicted probabilities
+  e1 <- expit(drop(X1 %*% alpha_hat))
+  
+  # 5) Per-observation ψ_{α,i} (n x p)
+  psi_alpha <- (Y - e1) * X1
+  
+  # 6) Meat B = (1/n) Σ ψ_i ψ_i^T
+  B_hat <- crossprod(psi_alpha) / n
+  
+  # 7) Bread A = (1/n) Σ ∂ψ_i/∂α^T = -(1/n) Σ indW * e(1-e) X X^T
+  w <-  e1 * (1 - e1)
+  A_hat <- -crossprod(X1, X1 * w) / n
+  
+  # 8) Sandwich vcov: Var(alpha_hat) = A^{-1} B A^{-T} / n
+  A_inv <- solve(A_hat)
+  V_alpha <- (A_inv %*% B_hat %*% t(A_inv)) / n
+  #######################################
+  
+  # 6) delta-method sandwich variance for lambda
+  var_lambda <- as.numeric(t(grad) %*% V_alpha %*% grad)
+  se_lambda  <- sqrt(var_lambda)
+  
+  list(lambda_hat = lambda_hat, se_lambda = se_lambda, var_lambda = var_lambda)
+}
+
+
+
+
+######################
+####NIE
+cNIE_sandwich <- function(data,model.out,model.med,model.ps,newdata) {
+  
+  ## 1) Fit the three logistic models
+  # beta: P(M=1 | V, L)
+  fit_M  <- glm(as.formula(model.med),  family = binomial(), data = data)
+  beta_hat <- coef(fit_M)
+  
+  # gamma: P(V=1 | L)
+  fit_V <- glm(as.formula(model.ps), family = binomial(), data = data)
+  gamma_hat <- coef(fit_V)
+  
+  # eta: P(V=1 | L, C=1)
+  fit_VC <- glm(as.formula(model.ps), family = binomial(), data = data, subset = (C == 1))
+  eta_hat <- coef(fit_VC)
+  
+  ## 2) Build design rows at L=l using your global 1-row newdat
+  newdata <- as.data.frame(newdata)  
+  
+  # --- X2 rows for mediator model: V=1 and V=0 
+  trm2_full <- terms(fit_M)
+  trm2_rhs  <- delete.response(trm2_full)
+  xlev2     <- fit_M$xlevels
+  
+  nd2_1 <- newdata; nd2_1$V <- 1
+  nd2_0 <- newdata; nd2_0$V <- 0
+  
+  mf2_1 <- model.frame(trm2_rhs, data = nd2_1, xlev = xlev2, na.action = na.pass)
+  mf2_0 <- model.frame(trm2_rhs, data = nd2_0, xlev = xlev2, na.action = na.pass)
+  X2_1  <- model.matrix(trm2_rhs, data = mf2_1)  # (1 x p_beta)
+  X2_0  <- model.matrix(trm2_rhs, data = mf2_0)
+  
+  # --- X3 row for V models
+  trm3_full <- terms(fit_V)
+  trm3_rhs  <- delete.response(trm3_full)
+  xlev3     <- fit_V$xlevels
+  
+  mf3 <- model.frame(trm3_rhs, data = newdata, xlev = xlev3, na.action = na.pass)
+  X3  <- model.matrix(trm3_rhs, data = mf3)      # (1 x p_gamma)
+  
+  # for eta model, use its own terms/levels (in case factors differ)
+  trm4_full <- terms(fit_VC)
+  trm4_rhs  <- delete.response(trm4_full)
+  xlev4     <- fit_VC$xlevels
+  
+  mf4 <- model.frame(trm4_rhs, data = newdata, xlev = xlev4, na.action = na.pass)
+  X3e <- model.matrix(trm4_rhs, data = mf4)      # (1 x p_eta)
+  
+  ## 3) Compute lambda2_hat
+  # A = expit(X2_1 beta) / expit(X2_0 beta)
+  m1 <- expit(drop(X2_1 %*% beta_hat))
+  m0 <- expit(drop(X2_0 %*% beta_hat))
+  A  <- as.numeric(m1 / m0)
+  
+  # B = expit(X3 gamma) / (1 - expit(X3 gamma))  
+  vW <- expit(drop(X3 %*% gamma_hat))
+  B  <- as.numeric(vW / (1 - vW))
+  
+  # C = (1 - expit(X3 eta)) / expit(X3 eta) = 1 / odds under C=1
+  vC <- expit(drop(X3 %*% eta_hat))
+  Cc <- as.numeric((1 - vC) / vC)
+  
+  lambda2_hat <- A * B * Cc
+  
+  ## 4) Delta-method gradients
+  
+  # Gradient w.r.t beta (through A only)
+  dm1 <- as.numeric(m1 * (1 - m1)) * as.numeric(X2_1)/as.numeric(m0)
+  dm0 <- as.numeric(m1 * (1 - m0)) * as.numeric(X2_0)/as.numeric(m0)
+  dA_dbeta <- dm1-dm0  # length p_beta
+  grad_beta <- (B * Cc) * dA_dbeta
+  
+  # Gradient w.r.t gamma (through B only)
+  # B = v/(1-v) ; dB/dγ = v/(1-v) * X = B * X
+  dB_dgamma <- as.numeric(B) * as.numeric(X3)   # length p_gamma
+  grad_gamma <- (A * Cc) * dB_dgamma
+  
+  # Gradient w.r.t eta (through Cc only)
+  # Cc = (1-v)/v = 1/v - 1 ; dCc/dη = -(1/v^2) * dv/dη
+  # dv/dη = v(1-v) X
+  dvC <- as.numeric(vC * (1 - vC)) * as.numeric(X3e)
+  #dCc_deta <- -exp(-vC** as.numeric(X3e))* as.numeric(X3e)
+  dCc_deta <- -Cc * as.numeric(X3e)
+  grad_eta <- (A * B) * dCc_deta
+  
+  # stacked gradient
+  grad <- c(grad_beta, grad_gamma, grad_eta)
+  
+  
+  ###################################################
+  ###variance-covariance matrix from stacked score functions
+  # 2) Build design matrices on the full dataset (factor-safe)
+  # X2 for beta model
+  mf2 <- model.frame(trm2_rhs, data = data, xlev = fit_M$xlevels, na.action = na.pass)
+  X2  <- model.matrix(trm2_rhs, data = mf2)
+  M   <- model.response(model.frame(fit_M, data = data, na.action = na.pass))
+  
+  # X3 for gamma model
+  mf3 <- model.frame(trm3_rhs, data = data, xlev = fit_V$xlevels, na.action = na.pass)
+  X3  <- model.matrix(trm3_rhs, data = mf3)
+  V   <- model.response(model.frame(fit_V, data = data, na.action = na.pass))
+  
+  # X3e for eta model (may differ due to factor levels / contrasts)
+  trm4_rhs <- delete.response(terms(fit_VC))
+  mf4 <- model.frame(trm4_rhs, data = data, xlev = fit_VC$xlevels, na.action = na.pass)
+  X3e <- model.matrix(trm4_rhs, data = mf4)
+  
+  # 3) Fitted probabilities (working models)
+  e2 <- expit(drop(X2  %*% beta_hat))   # P(M=1 | V,L)
+  e3 <- expit(drop(X3  %*% gamma_hat))  # P(V=1 | L)
+  e4 <- expit(drop(X3e %*% eta_hat))    # P(V=1 | L, C=1)  (fit among C=1)
+  
+  indC <- as.numeric(data$C == 1)
+  n <- nrow(data)
+  # 4) Per-observation estimating functions psi_i (stacked)
+  psi_beta  <- (M - e2) * X2
+  psi_gamma <- (V - e3) * X3
+  psi_eta   <- (indC * (V - e4)) * X3e
+  
+  psi_stack <- cbind(psi_beta, psi_gamma, psi_eta)  # n x p_total
+  
+  # 5) B (meat): (1/n) Σ psi_i psi_i^T
+  B_hat <- crossprod(psi_stack) / n
+  
+  # 6) A (bread): (1/n) Σ ∂psi_i/∂theta^T
+  # For logistic score: ∂/∂θ [X(y-p)] = - X X^T p(1-p)
+  w2 <- e2 * (1 - e2)
+  w3 <- e3 * (1 - e3)
+  w4 <- indC * e4 * (1 - e4)
+  
+  A_beta  <- -crossprod(X2,  X2  * w2) / n
+  A_gamma <- -crossprod(X3,  X3  * w3) / n
+  A_eta   <- -crossprod(X3e, X3e * w4) / n
+  
+  pB <- ncol(X2); pG <- ncol(X3); pE <- ncol(X3e)
+  A_hat <- matrix(0, nrow = pB + pG + pE, ncol = pB + pG + pE)
+  A_hat[1:pB, 1:pB] <- A_beta
+  A_hat[(pB+1):(pB+pG), (pB+1):(pB+pG)] <- A_gamma
+  A_hat[(pB+pG+1):(pB+pG+pE), (pB+pG+1):(pB+pG+pE)] <- A_eta
+  
+  # 7) Sandwich covariance: Var(theta_hat) = A^{-1} B A^{-T} / n
+  A_inv <- solve(A_hat)
+  V_hat <- (A_inv %*% B_hat %*% t(A_inv)) / n
+  ###############################################
+  
+  
+  # full delta-method variance with cross-covariances
+  var_lambda2 <- as.numeric(t(grad) %*% V_hat %*% grad)
+  se_lambda2  <- sqrt(var_lambda2)
+  
+  list(
+    lambda2_hat = lambda2_hat,
+    se_lambda2  = se_lambda2,
+    var_lambda2 = var_lambda2
+  )
+}
+
+
+
+#cTE
+cTE_sandwich <- function(data, model.out, model.med, model.ps, newdata) {
+  expit <- function(x) plogis(x)
+  
+  data <- as.data.frame(data)
+  newdata <- as.data.frame(newdata)
+  
+  if (nrow(newdata) != 1L) {
+    stop("newdata must contain exactly one covariate profile (one row).")
+  }
+  if (!all(c("M", "V", "C") %in% names(data))) {
+    stop("data must contain variables named M, V, and C.")
+  }
+  
+  ## 1. Fit all working models
+  fit_Y  <- glm(as.formula(model.out), family = binomial(), data = data)
+  fit_M  <- glm(as.formula(model.med), family = binomial(), data = data)
+  fit_V  <- glm(as.formula(model.ps),  family = binomial(), data = data)
+  fit_VC <- glm(as.formula(model.ps),  family = binomial(), data = data,
+                subset = (C == 1))
+  
+  alpha <- coef(fit_Y)
+  beta  <- coef(fit_M)
+  gamma <- coef(fit_V)
+  eta   <- coef(fit_VC)
+  
+  if (anyNA(c(alpha, beta, gamma, eta))) {
+    stop("At least one fitted model has non-estimable coefficients.")
+  }
+  
+  ## Helper: construct a model matrix using a fitted model's terms/levels
+  mm <- function(fit, d) {
+    rhs <- delete.response(terms(fit))
+    mf <- model.frame(rhs, data = d, xlev = fit$xlevels,
+                      na.action = na.pass)
+    model.matrix(rhs, data = mf, contrasts.arg = fit$contrasts)
+  }
+  
+  ## 2. cNDE and its gradient with respect to alpha
+  # As in the supplied cNDE function, evaluate Y at M=1 and compare V=1 vs V=0.
+  nd_y1 <- newdata
+  nd_y0 <- newdata
+  nd_y1$M <- nd_y0$M <- 1
+  nd_y1$V <- 1
+  nd_y0$V <- 0
+  
+  x_y1 <- mm(fit_Y, nd_y1)
+  x_y0 <- mm(fit_Y, nd_y0)
+  y1 <- expit(drop(x_y1 %*% alpha))
+  y0 <- expit(drop(x_y0 %*% alpha))
+  cNDE_hat <- as.numeric(y1 / y0)
+  
+  # d log(y1/y0)/d alpha = (1-y1)x_y1 - (1-y0)x_y0
+  grad_nde_alpha <- cNDE_hat *
+    ((1 - y1) * as.numeric(x_y1) -
+       (1 - y0) * as.numeric(x_y0))
+  
+  ## 3. cNIE and gradients with respect to beta, gamma, and eta
+  nd_m1 <- newdata
+  nd_m0 <- newdata
+  nd_m1$V <- 1
+  nd_m0$V <- 0
+  
+  x_m1 <- mm(fit_M, nd_m1)
+  x_m0 <- mm(fit_M, nd_m0)
+  x_v  <- mm(fit_V,  newdata)
+  x_vc <- mm(fit_VC, newdata)
+  
+  m1 <- expit(drop(x_m1 %*% beta))
+  m0 <- expit(drop(x_m0 %*% beta))
+  pv <- expit(drop(x_v %*% gamma))
+  pc <- expit(drop(x_vc %*% eta))
+  
+  med_ratio <- as.numeric(m1 / m0)
+  odds_v    <- as.numeric(pv / (1 - pv))
+  inv_odds_c <- as.numeric((1 - pc) / pc)
+  cNIE_hat <- med_ratio * odds_v * inv_odds_c
+  
+  # Log-gradient form gives compact, stable product-rule derivatives.
+  grad_nie_beta <- cNIE_hat *
+    ((1 - m1) * as.numeric(x_m1) -
+       (1 - m0) * as.numeric(x_m0))
+  grad_nie_gamma <- cNIE_hat * as.numeric(x_v)
+  grad_nie_eta   <- -cNIE_hat * as.numeric(x_vc)
+  
+  ## 4. Gradient of cTE = cNDE*cNIE for theta=(alpha,beta,gamma,eta)
+  cTE_hat <- cNDE_hat * cNIE_hat
+  grad_te <- c(
+    cNIE_hat * grad_nde_alpha,
+    cNDE_hat * grad_nie_beta,
+    cNDE_hat * grad_nie_gamma,
+    cNDE_hat * grad_nie_eta
+  )
+  
+  ## 5. Joint stacked estimating functions
+  # Requiring complete data keeps every score row aligned. If the supplied GLMs
+  # use different analysis samples, a joint observation-level sandwich needs an
+  # explicit missing-data convention instead.
+  needed <- unique(c(all.vars(as.formula(model.out)),
+                     all.vars(as.formula(model.med)),
+                     all.vars(as.formula(model.ps)), "C"))
+  if (anyNA(data[, needed, drop = FALSE])) {
+    stop(paste0(
+      "Variables used by the models contain missing values. Supply a common ",
+      "complete-case data set before calling cTE_sandwich()."
+    ))
+  }
+  
+  X_y  <- mm(fit_Y,  data)
+  X_m  <- mm(fit_M,  data)
+  X_v  <- mm(fit_V,  data)
+  X_vc <- mm(fit_VC, data)
+  
+  Y <- model.response(model.frame(fit_Y, data = data,
+                                  na.action = na.pass))
+  M <- model.response(model.frame(fit_M, data = data,
+                                  na.action = na.pass))
+  V <- model.response(model.frame(fit_V, data = data,
+                                  na.action = na.pass))
+  
+  py <- expit(drop(X_y %*% alpha))
+  pm <- expit(drop(X_m %*% beta))
+  pv_all <- expit(drop(X_v %*% gamma))
+  pc_all <- expit(drop(X_vc %*% eta))
+  ind_c <- as.numeric(data$C == 1)
+  
+  psi_alpha <- (Y - py) * X_y
+  psi_beta  <- (M - pm) * X_m
+  psi_gamma <- (V - pv_all) * X_v
+  psi_eta   <- ind_c * (V - pc_all) * X_vc
+  psi <- cbind(psi_alpha, psi_beta, psi_gamma, psi_eta)
+  
+  n <- nrow(data)
+  meat <- crossprod(psi) / n
+  
+  bread_alpha <- -crossprod(X_y,  X_y  * (py * (1 - py))) / n
+  bread_beta  <- -crossprod(X_m,  X_m  * (pm * (1 - pm))) / n
+  bread_gamma <- -crossprod(X_v,  X_v  * (pv_all * (1 - pv_all))) / n
+  bread_eta   <- -crossprod(X_vc, X_vc *
+                              (ind_c * pc_all * (1 - pc_all))) / n
+  
+  dims <- c(ncol(X_y), ncol(X_m), ncol(X_v), ncol(X_vc))
+  ends <- cumsum(dims)
+  starts <- c(1L, head(ends, -1L) + 1L)
+  bread <- matrix(0, sum(dims), sum(dims))
+  blocks <- list(bread_alpha, bread_beta, bread_gamma, bread_eta)
+  for (j in seq_along(blocks)) {
+    bread[starts[j]:ends[j], starts[j]:ends[j]] <- blocks[[j]]
+  }
+  
+  bread_inv <- solve(bread)
+  vcov_theta <- bread_inv %*% meat %*% t(bread_inv) / n
+  
+  ## 6. Delta-method sandwich variance
+  var_cTE <- as.numeric(crossprod(grad_te, vcov_theta %*% grad_te))
+  # Guard only against negligible negative round-off.
+  if (var_cTE < 0 && var_cTE > -sqrt(.Machine$double.eps)) var_cTE <- 0
+  se_cTE <- sqrt(var_cTE)
+  
+  list(
+    cTE_hat = cTE_hat,
+    #se_cTE = se_cTE,
+    var_cTE = var_cTE,
+    cNDE_hat = cNDE_hat,
+    cNIE_hat = cNIE_hat
+    #vcov_theta = vcov_theta,
+    #gradient_cTE = grad_te
+  )
+}
+
+
+#######output#######
+################################
+###model 1: no interaction
+################################
+#examples
+out<-med.est(data=dat,id="ID",control.ind="control_indicator",mediator="covid_case",trt="vaccination",
+             outcome="long_COVID",
+             model.out="Y~M+V+as.factor(sex)+as.factor(age)+as.factor(region)+as.factor(material_deprivation)+as.factor(social_deprivation)+as.factor(n_comorbidity)+as.factor(profession)+as.factor(establishment)+as.factor(variant_period)",
+             model.med="M~V+as.factor(sex)+as.factor(age)+as.factor(region)+as.factor(material_deprivation)+as.factor(social_deprivation)+as.factor(n_comorbidity)+as.factor(profession)+as.factor(establishment)+as.factor(variant_period)",
+             model.ps="V~as.factor(region)+as.factor(material_deprivation)+as.factor(social_deprivation)+as.factor(n_comorbidity)+as.factor(profession)+as.factor(establishment)+as.factor(variant_period)",
+             fix.val=c(1,1,2,2,2,0,1,1,1),boots=1000)
+out$value
+
+out.dat0.1<-data.frame("cNDE"=out$cNDE,"cNIE"=out$cNIE,"cTE"=out$cTE,"cCDE"=out$cCDE,
+                       "boots.cNDE"=out$boots.cNDE,"boots.cNIE"=out$boots.cNIE,"boots.cTE"=out$boots.cTE,"boots.cCDE"=out$boots.cCDE,
+                       "sand.cNDE"=out$sand.cNDE,"sand.cNIE"=out$sand.cNIE,"sand.cTE"=out$sand.cTE,
+                       "cNDE.l"=out$cNDE.l,"cNDE.u"=out$cNDE.u,"cNIE.l"=out$cNIE.l,"cNIE.u"=out$cNIE.u,
+                       "cTE.l"=out$cTE.l,"cTE.u"=out$cTE.u,"cCDE.l"=out$cCDE.l,"cCDE.u"=out$cCDE.u)
+out.dat0.1
+
+
+
