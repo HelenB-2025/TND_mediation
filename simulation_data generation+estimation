@@ -1,0 +1,735 @@
+
+
+library(dplyr)
+library(LaplacesDemon)
+
+#########################DATA GENERATION#########################
+#parameter values
+OR1_I1<-0.03
+OR1_W1<-4/5
+OR1_H1<-1
+OR1_I2<-3/5
+OR1_W2<-4/6
+OR1_H2<-1
+OR1_Y<-1/2
+
+
+
+##########################################################
+#####simulation function:  pop with random covariates#####
+##########################################################
+set.seed(100)
+data.gen.post.rand<-function(popsize=1000000){
+  ####1st timepoint
+  #Confounder
+  L1<-rbern(popsize,0.5)         
+  L2<-runif(popsize,0,1)
+  L3<-rbern(popsize,0.4)
+  
+  V=rbinom(prob=plogis(0.8+0.3*L1+0.3*L2),size=1,n=popsize) 
+  
+  #other infection
+  I0<-rep(0,popsize)
+  I0<-rbinom(prob=plogis(0.2*L1+0.2*L3-3), 
+             size=1,n=popsize)        
+  
+  #potential COVID infection
+  I1_1<-rep(0,popsize);I1_0<-rep(0,popsize)
+  I1_1<-rbinom(prob=plogis(log(OR1_I1)+0.2*L1+0.2*L3-2.5), 
+               size=1,n=popsize)        
+  I1_0<-rbinom(prob=plogis(0.2*L1+0.2*L3-2.5), 
+               size=1,n=popsize)        
+  #observed COVID infection
+  I1=rep(0,popsize)                                        
+  I1[V==0]<-I1_0[V==0]                  
+  I1[V==1]<-I1_1[V==1]                  
+  
+  
+  #symptom caused by other pathogen
+  W0=rep(0,popsize);
+  W0[I0==1]<-rbinom(prob=plogis(-2+0.1*L1[I0==1]+0.1*L3[I0==1])
+                    ,size=1, n=sum(I0==1))  
+  
+  #symptom caused by COVID
+  #potential symptom
+  W1_1=rep(0,popsize);W1_0=rep(0,popsize);W1=rep(0,popsize);
+  W1_1[I1_1==1]<-rbinom(prob=plogis(-1+0.3*L1[I1_1==1]+0.2*L3[I1_1==1]+log(OR1_W1))
+                        ,size=1,n=sum(I1_1==1))   
+  W1_0[I1_0==1]<-rbinom(prob=plogis(-1+0.3*L1[I1_0==1]+0.2*L3[I1_0==1])
+                        ,size=1,n=sum(I1_0==1))   
+  #observed symptom
+  W1[V==1]<- W1_1[V==1]    
+  W1[V==0]<- W1_0[V==0]    
+  
+  #COVID-like symptom
+  W_1=rep(0,popsize);W_0=rep(0,popsize);W=rep(0,popsize);
+  W_1<-ifelse((W0==1|W1_1==1),1,0) 
+  W_0<-ifelse((W0==1|W1_0==1),1,0)
+  W<-ifelse((W0==1|W1==1),1,0)
+  
+  
+  #Hospitalization/Tested, random samples from COVID-like symptom population
+  H=rep(0,popsize);H_1=rep(0,popsize);H_0=rep(0,popsize);
+  H_1[W_1==1]<-rbinom(prob=plogis(0.5)
+                      ,size=1, n=sum(W_1==1))
+  H_0[W_0==1]<-rbinom(prob=plogis(0.5)
+                      ,size=1, n=sum(W_0==1))
+  H[V==1]<-H_1[V==1]
+  H[V==0]<-H_0[V==0]
+  
+  
+  ####long-COVID requires first infection and COVID symptom
+  Y<-rep(0,popsize);
+  Y1_M1<-rep(0,popsize);Y0_M1<-rep(0,popsize);
+  Y1_M0<-rep(0,popsize);Y0_M0<-rep(0,popsize);
+  Y1_1<-rep(0,popsize);Y0_1<-rep(0,popsize)
+  #potential outcome
+  Y1_M1[W1_1==1]<-rbinom(prob=plogis(0.2*L2[W1_1==1]+0.2*L3[W1_1==1]+log(OR1_Y)+
+                                       0.2*W1_1[W1_1==1]),size=1,n=sum(W1_1==1))         
+  Y1_M0[W1_0==1]<-rbinom(prob=plogis(0.2*L2[W1_0==1]+0.2*L3[W1_0==1]+log(OR1_Y)+
+                                       0.2*W1_0[W1_0==1]),size=1,n=sum(W1_0==1))    
+  
+  Y0_M1[W1_1==1]<-rbinom(prob=plogis(0.2*L2[W1_1==1]+0.2*L3[W1_1==1]+0.2*W1_1[W1_1==1]),
+                         size=1,n=sum(W1_1==1))
+  Y0_M0[W1_0==1]<-rbinom(prob=plogis(0.2*L2[W1_0==1]+0.2*L3[W1_0==1]+0.2*W1_0[W1_0==1]),  
+                         size=1,n=sum(W1_0==1))     
+  
+  Y1_1<-rbinom(prob=plogis(0.2*L2+0.2*L3+log(OR1_Y)+0.2),
+               size=1,n=popsize)
+  Y0_1<-rbinom(prob=plogis(0.2*L2+0.2*L3+0.2),
+               size=1,n=popsize)
+  #observed outcome
+  Y[V==0]<-Y0_M0[V==0]                
+  Y[V==1]<-Y1_M1[V==1]                
+  
+  
+  ID=seq(1:popsize)
+  dat<-data.frame(ID,L1,L2,L3,V,I0,I1,I1_0,I1_1,W,W_1,W_0,W0,W1,W1_1,W1_0,H,H_1,H_0,Y,Y0_M0,Y0_M1,Y1_M0,Y1_M1,Y1_1,Y0_1)
+  
+  return(dat)
+}
+
+
+
+
+#########################var functions###########################
+##################bootstrap#######################
+bvar<-function(loop=boots,dat,l1,l2,l3){
+  cNDE.s<-rep(0,loop);cNIE.TND.s<-rep(0,loop);cNIE.s<-rep(0,loop);
+  cNDE.non.s<-rep(0,loop);cNIE.ic.non.s<-rep(0,loop);cNIE.tndc.non.s<-rep(0,loop);
+  cNIE.ic.s<-rep(0,loop);  cNIE.tndc.s<-rep(0,loop)
+  
+  W.cNDE.s<-rep(0,loop);W.cNIE.TND.s<-rep(0,loop);W.cNIE.s<-rep(0,loop);
+  W.cNDE.non.s<-rep(0,loop);W.cNIE.ic.non.s<-rep(0,loop);W.cNIE.tndc.non.s<-rep(0,loop);
+  W.cNIE.ic.s<-rep(0,loop);W.cNIE.tndc.s<-rep(0,loop)
+  
+  cCDE.s<-rep(0,loop);W.cCDE.s<-rep(0,loop)
+  
+  for (j in 1:loop){
+    s.dat<-dat[sample(nrow(dat),nrow(dat),replace=TRUE),]
+    
+    #cNDE
+    #logistic regression for outcome model P(Y=1|M,V,L,W)
+    out.model<-glm(Y~L1+L2+L3+V+M+V*L1+V*L2+V*L3,data=s.dat,family="binomial"(link = "logit"))
+    newdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1,M=1)
+    newdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0,M=1)
+    pred1<-predict(out.model,newdata=newdat1,type="response")
+    pred0<-predict(out.model,newdata=newdat0,type="response")
+    cNDE.s[j]<-pred1/pred0
+    #cCDE on OR
+    cCDE.s[j]<-(pred1/(1-pred1))/(pred0/(1-pred0))
+    
+    #W is used to define M
+    #cNDE
+    #logistic regression for outcome model P(Y=1|M,V,L,W)
+    out.model<-glm(Y~L1+L2+L3+V+W.M+V*L1+V*L2+V*L3,data=s.dat,family="binomial"(link = "logit"))
+    wnewdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1,W.M=1)
+    wnewdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0,W.M=1)
+    pred1<-predict(out.model,newdata=wnewdat1,type="response")
+    pred0<-predict(out.model,newdata=wnewdat0,type="response")
+    W.cNDE.s[j]<-pred1/pred0
+    #cCDE on OR
+    W.cCDE.s[j]<-(pred1/(1-pred1))/(pred0/(1-pred0))
+    
+    #cNIE
+    #logistic regression for mediator model P(M=1|V,L,W)
+    mediator.model<-glm(M~V+L1+L2+L3+V*L1+V*L2+V*L3,data=s.dat,family="binomial"(link = "logit"))
+    newdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1)
+    newdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0)
+    pred1<-predict(mediator.model,newdata=newdat1,type="response")
+    pred0<-predict(mediator.model,newdata=newdat0,type="response")
+    cNIE.TND.s[j]<-pred1/pred0
+    #2 ratios
+    #ps ratio
+    ps.model<-glm(V~L1+L2+L3,data=s.dat,family="binomial"(link = "logit"))
+    newdat<-data.frame(L1=l1,L2=l2,L3=l3)
+    ps.pred<-predict(ps.model,newdata=newdat,type="response")
+    ratio.ps<-ps.pred/(1-ps.pred)
+    #ideal control
+    s.dat.ic<-subset(s.dat,s.dat$I0==1&s.dat$W0==1)
+    ps.ic.model<-glm(V~L1+L2+L3,data=s.dat.ic,family="binomial"(link = "logit"))
+    ps.ic.pred<-predict(ps.ic.model,newdata=newdat,type="response")
+    ratio.ps.ic<-ps.ic.pred/(1-ps.ic.pred)
+    #TND control
+    s.dat.c<-subset(s.dat,s.dat$I1!=1)
+    ps.c.model<-glm(V~L1+L2+L3,data=s.dat.c,family="binomial"(link = "logit"))
+    ps.c.pred<-predict(ps.c.model,newdata=newdat,type="response")
+    ratio.ps.c<-ps.c.pred/(1-ps.c.pred)
+    
+    cNIE.ic.s[j]<-cNIE.TND.s[j]*ratio.ps/ratio.ps.ic
+    cNIE.tndc.s[j]<-cNIE.TND.s[j]*ratio.ps/ratio.ps.c
+    
+    #Only W is observable
+    #logistic regression for mediator model P(M=1|V,L,W)
+    mediator.model<-glm(W.M~V+L1+L2+L3+V*L1+V*L2+V*L3,data=s.dat,family="binomial"(link = "logit"))
+    pred1<-predict(mediator.model,newdata=newdat1,type="response")
+    pred0<-predict(mediator.model,newdata=newdat0,type="response")
+    W.cNIE.TND.s[j]<-pred1/pred0
+    
+    W.cNIE.ic.s[j]<-W.cNIE.TND.s[j]*ratio.ps/ratio.ps.ic
+    W.cNIE.tndc.s[j]<-W.cNIE.TND.s[j]*ratio.ps/ratio.ps.c
+  } 
+  
+  out<-list("cNDE.s"=cNDE.s,"cNDE.non.s"=cNDE.non.s,
+            "cNIE.tndc.s"=cNIE.tndc.s,"cNIE.ic.s"=cNIE.ic.s,
+            "cNIE.tndc.non.s"=cNIE.tndc.non.s,"cNIE.ic.non.s"=cNIE.ic.non.s,
+            "cCDE.s"=cCDE.s,"W.cCDE.s"=W.cCDE.s,
+            "W.cNDE.s"=W.cNDE.s,"W.cNDE.non.s"=W.cNDE.non.s,
+            "W.cNIE.tndc.s"=W.cNIE.tndc.s,"W.cNIE.ic.s"=W.cNIE.ic.s,
+            "W.cNIE.tndc.non.s"=W.cNIE.tndc.non.s,"W.cNIE.ic.non.s"=W.cNIE.ic.non.s)
+  return(out)
+}
+
+
+#########sandwich estimator function##########
+###cNDE
+expit <- function(x) 1/(1 + exp(-x))
+
+cNDE_sandwich <- function(data,newdata=newdat1,W=TRUE) {
+  
+  if(W==TRUE){ 
+    data<-subset(data,select=-c(M))
+    data <- data %>% rename(M = W.M)
+    newdata <- newdata %>% rename(M = W.M)
+  }
+  
+  # 1) Fit logistic model
+  fit <- glm(as.formula(Y~M+V+L1+L2+L3+V*L1+V*L2+V*L3), family = binomial(), data = data)
+  alpha_hat <- coef(fit)
+  # --- KEY FIX: use RHS-only terms for newdata matrices ---
+  trm_full <- terms(fit)                 # includes response
+  trm_rhs  <- delete.response(trm_full)  # RHS only
+  rhs_vars <- all.vars(trm_rhs)
+  xlev     <- fit$xlevels
+  # create nd1 (V=1) and nd0 (V=0)
+  nd1 <- newdata
+  nd0 <- newdata
+  nd1$V <- 1
+  nd0$V <- 0
+  # model matrices for the two design vectors
+  mf1 <- model.frame(trm_rhs, data = nd1, xlev = xlev, na.action = na.pass)
+  mf0 <- model.frame(trm_rhs, data = nd0, xlev = xlev, na.action = na.pass)
+  x1  <- model.matrix(trm_rhs, data = mf1)
+  x0  <- model.matrix(trm_rhs, data = mf0)
+  # 4) lambda_hat
+  eta1 <- drop(x1 %*% alpha_hat)
+  eta0 <- drop(x0 %*% alpha_hat)
+  p1 <- expit(eta1)
+  p0 <- expit(eta0)
+  lambda_hat <- as.numeric(p1 / p0)
+  # 5) gradient d lambda / d alpha
+  dp1 <- as.numeric(p1 * (1 - p1)) * as.numeric(x1)
+  dp0 <- as.numeric(p0 * (1 - p0)) * as.numeric(x0)
+  grad <- (dp1 / p0) - (p1 / (p0^2)) * dp0
+  
+  #######################################
+  n <- nrow(data)
+  # 2) Sandwich variance for alpha_hat
+  mf_rhs  <- model.frame(trm_rhs, data = data, xlev = fit$xlevels, na.action = na.pass)
+  X1 <- model.matrix(trm_rhs, data = mf_rhs)
+  Y  <- model.response(model.frame(fit, data = data, na.action = na.pass))
+  # 3) Predicted probabilities
+  e1 <- expit(drop(X1 %*% alpha_hat))
+  # 5) Per-observation ψ_{α,i} (n x p)
+  psi_alpha <- (Y - e1) * X1
+  # 6) Meat B = (1/n) Σ ψ_i ψ_i^T
+  B_hat <- crossprod(psi_alpha) / n
+  # 7) Bread A = (1/n) Σ ∂ψ_i/∂α^T = -(1/n) Σ indW * e(1-e) X X^T
+  w <-  e1 * (1 - e1)
+  A_hat <- -crossprod(X1, X1 * w) / n
+  # 8) Sandwich vcov: Var(alpha_hat) = A^{-1} B A^{-T} / n
+  A_inv <- solve(A_hat)
+  V_alpha <- (A_inv %*% B_hat %*% t(A_inv)) / n
+  # 6) delta-method sandwich variance for lambda
+  var_lambda <- as.numeric(t(grad) %*% V_alpha %*% grad)
+  se_lambda  <- sqrt(var_lambda)
+  
+  list(cNDE.var = var_lambda)
+}
+
+
+
+####NIE
+cNIE_sandwich <- function(data=TND,newdata=mdat1,IC=FALSE,W=TRUE) {
+  # 2) Build design rows at L=l using your global 1-row newdat
+  #newdat <- as.data.frame(newdat) 
+  
+  if(W==TRUE){ 
+   data<-subset(data,select=-c(M))
+   data <- data %>% rename(M = W.M)
+   #newdata <- newdata %>% rename(M = W.M)
+  }
+  
+  ## 1) Fit the three logistic models
+  # beta: P(M=1 | V, L)
+  fit_M  <- glm(as.formula(M~V+L1+L2+L3+V*L1+V*L2+V*L3),  family = binomial(), data = data)
+  beta_hat <- coef(fit_M)
+  
+  # gamma: P(V=1 | L)
+  fit_V <- glm(as.formula(V~L1+L2+L3), family = binomial(), data = data)
+  gamma_hat <- coef(fit_V)
+  
+  # eta: P(V=1 | L, C=0)
+  if(IC==TRUE){
+    fit_VC <- glm(as.formula(V~L1+L2+L3), family = binomial(), data = data, subset = (I0==1&W0==1))
+  }else{fit_VC <- glm(as.formula(V~L1+L2+L3), family = binomial(), data = data, subset = (I1!=1))}
+  eta_hat <- coef(fit_VC)
+  
+  ## 2) Build design rows at L=l using your global 1-row newdat
+  #newdata <- as.data.frame(newdata)  
+  # --- X2 rows for mediator model: V=1 and V=0 
+  trm2_full <- terms(fit_M)
+  trm2_rhs  <- delete.response(trm2_full)
+  xlev2     <- fit_M$xlevels
+  
+  nd2_1 <- newdata; nd2_1$V <- 1
+  nd2_0 <- newdata; nd2_0$V <- 0
+  
+  mf2_1 <- model.frame(trm2_rhs, data = nd2_1, xlev = xlev2, na.action = na.pass)
+  mf2_0 <- model.frame(trm2_rhs, data = nd2_0, xlev = xlev2, na.action = na.pass)
+  X2_1  <- model.matrix(trm2_rhs, data = mf2_1)  # (1 x p_beta)
+  X2_0  <- model.matrix(trm2_rhs, data = mf2_0)
+  
+  # --- X3 row for V models
+  trm3_full <- terms(fit_V)
+  trm3_rhs  <- delete.response(trm3_full)
+  xlev3     <- fit_V$xlevels
+  
+  mf3 <- model.frame(trm3_rhs, data = newdata, xlev = xlev3, na.action = na.pass)
+  X3  <- model.matrix(trm3_rhs, data = mf3)      # (1 x p_gamma)
+  
+  # for eta model, use its own terms/levels (in case factors differ)
+  trm4_full <- terms(fit_VC)
+  trm4_rhs  <- delete.response(trm4_full)
+  xlev4     <- fit_VC$xlevels
+  
+  mf4 <- model.frame(trm4_rhs, data = newdata, xlev = xlev4, na.action = na.pass)
+  X3e <- model.matrix(trm4_rhs, data = mf4)      # (1 x p_eta)
+  
+  ## 3) Compute lambda2_hat
+  # A = expit(X2_1 beta) / expit(X2_0 beta)
+  m1 <- expit(drop(X2_1 %*% beta_hat))
+  m0 <- expit(drop(X2_0 %*% beta_hat))
+  A  <- as.numeric(m1 / m0)
+  
+  # B = expit(X3 gamma) / (1 - expit(X3 gamma))  
+  vW <- expit(drop(X3 %*% gamma_hat))
+  B  <- as.numeric(vW / (1 - vW))
+  
+  # C = (1 - expit(X3 eta)) / expit(X3 eta) = 1 / odds under C=1
+  vC <- expit(drop(X3e %*% eta_hat))
+  Cc <- as.numeric((1 - vC) / vC)
+  
+  lambda2_hat <- A * B * Cc
+  
+  ## 4) Delta-method gradients
+  
+  # Gradient w.r.t beta (through A only)
+  dm1 <- as.numeric(m1 * (1 - m1)) * as.numeric(X2_1)/as.numeric(m0)
+  dm0 <- as.numeric(m1 * (1 - m0)) * as.numeric(X2_0)/as.numeric(m0)
+  dA_dbeta <- dm1-dm0  # length p_beta
+  grad_beta <- (B * Cc) * dA_dbeta
+  
+  # Gradient w.r.t gamma (through B only)
+  # B = v/(1-v) ; dB/dγ = v/(1-v) * X = B * X
+  dB_dgamma <- as.numeric(B) * as.numeric(X3)   # length p_gamma
+  grad_gamma <- (A * Cc) * dB_dgamma
+  
+  # Gradient w.r.t eta (through Cc only)
+  # Cc = (1-v)/v = 1/v - 1 ; dCc/dη = -(1/v^2) * dv/dη
+  # dv/dη = v(1-v) X
+  dvC <- as.numeric(vC * (1 - vC)) * as.numeric(X3e)
+  #dCc_deta <- -exp(-vC** as.numeric(X3e))* as.numeric(X3e)
+  dCc_deta <- -Cc * as.numeric(X3e)
+  grad_eta <- (A * B) * dCc_deta
+  
+  # stacked gradient
+  grad <- c(grad_beta, grad_gamma, grad_eta)
+  
+  
+  ###################################################
+  ###variance-covariance matrix from stacked score functions
+  # 2) Build design matrices on the full dataset (factor-safe)
+  # X2 for beta model
+  mf2 <- model.frame(trm2_rhs, data = data, xlev = fit_M$xlevels, na.action = na.pass)
+  X2  <- model.matrix(trm2_rhs, data = mf2)
+  M   <- model.response(model.frame(fit_M, data = data, na.action = na.pass))
+  
+  # X3 for gamma model
+  mf3 <- model.frame(trm3_rhs, data = data, xlev = fit_V$xlevels, na.action = na.pass)
+  X3  <- model.matrix(trm3_rhs, data = mf3)
+  V   <- model.response(model.frame(fit_V, data = data, na.action = na.pass))
+  
+  # X3e for eta model (may differ due to factor levels / contrasts)
+  trm4_rhs <- delete.response(terms(fit_VC))
+  mf4 <- model.frame(trm4_rhs, data = data, xlev = fit_VC$xlevels, na.action = na.pass)
+  X3e <- model.matrix(trm4_rhs, data = mf4)
+  
+  # 3) Fitted probabilities (working models)
+  e2 <- expit(drop(X2  %*% beta_hat))   # P(M=1 | V,L)
+  e3 <- expit(drop(X3  %*% gamma_hat))  # P(V=1 | L)
+  e4 <- expit(drop(X3e %*% eta_hat))    # P(V=1 | L, C=1)  (fit among C=1)
+  
+  if(IC==TRUE){
+    indC <- as.numeric(data$I0==1&data$W0==1)
+  }else{indC <-as.numeric(data$I1!=1)}
+  n <- nrow(data)
+  # 4) Per-observation estimating functions psi_i (stacked)
+  psi_beta  <- (M - e2) * X2
+  psi_gamma <- (V - e3) * X3
+  psi_eta   <- (indC * (V - e4)) * X3e
+  
+  psi_stack <- cbind(psi_beta, psi_gamma, psi_eta)  # n x p_total
+  
+  # 5) B (meat): (1/n) Σ psi_i psi_i^T
+  B_hat <- crossprod(psi_stack) / n
+  
+  # 6) A (bread): (1/n) Σ ∂psi_i/∂theta^T
+  # For logistic score: ∂/∂θ [X(y-p)] = - X X^T p(1-p)
+  w2 <- e2 * (1 - e2)
+  w3 <- e3 * (1 - e3)
+  w4 <- indC * e4 * (1 - e4)
+  
+  A_beta  <- -crossprod(X2,  X2  * w2) / n
+  A_gamma <- -crossprod(X3,  X3  * w3) / n
+  A_eta   <- -crossprod(X3e, X3e * w4) / n
+  
+  pB <- ncol(X2); pG <- ncol(X3); pE <- ncol(X3e)
+  A_hat <- matrix(0, nrow = pB + pG + pE, ncol = pB + pG + pE)
+  A_hat[1:pB, 1:pB] <- A_beta
+  A_hat[(pB+1):(pB+pG), (pB+1):(pB+pG)] <- A_gamma
+  A_hat[(pB+pG+1):(pB+pG+pE), (pB+pG+1):(pB+pG+pE)] <- A_eta
+  
+  # 7) Sandwich covariance: Var(theta_hat) = A^{-1} B A^{-T} / n
+  A_inv <- solve(A_hat)
+  V_hat <- (A_inv %*% B_hat %*% t(A_inv)) / n
+  ###############################################
+  
+  
+  # full delta-method variance with cross-covariances
+  var_lambda2 <- as.numeric(t(grad) %*% V_hat %*% grad)
+  se_lambda2  <- sqrt(var_lambda2)
+  
+  list(
+    cNIE.var = var_lambda2
+  )
+}
+
+
+
+
+#################simulation function：random covariates#####################
+EST.post.rand<-function(time=100,pops=8000000,tnd=8000,boots=0,l1,l2,l3,T.cNDE,T.cNIE,T.cCDE){
+  cNDE<-rep(0,time);cNIE.TND<-rep(0,time);cNIE<-rep(0,time);
+  cNIE.ic<-rep(0,time);  cNIE.tndc<-rep(0,time)
+  cCDE<-rep(0,time)
+    
+  W.cNDE<-rep(0,time);W.cNIE.TND<-rep(0,time);W.cNIE<-rep(0,time);
+  W.cNIE.ic<-rep(0,time);  W.cNIE.tndc<-rep(0,time)
+  W.cCDE<-rep(0,time)
+    
+  cNDE.cover<-rep(0,time);cNDE.var<-rep(0,time);
+  cNDE.non.cover<-rep(0,time);cNDE.non.var<-rep(0,time)
+  cNIE.tndc.cover<-rep(0,time);cNIE.tndc.var<-rep(0,time)
+  cNIE.ic.cover<-rep(0,time);cNIE.ic.var<-rep(0,time)
+  cNIE.tndc.non.cover<-rep(0,time);cNIE.tndc.non.var<-rep(0,time)
+  cNIE.ic.non.cover<-rep(0,time);cNIE.ic.non.var<-rep(0,time)
+  W.cNDE.cover<-rep(0,time);W.cNDE.var<-rep(0,time)
+  W.cNDE.non.cover<-rep(0,time);W.cNDE.non.var<-rep(0,time)
+  W.cNIE.tndc.cover<-rep(0,time);W.cNIE.tndc.var<-rep(0,time)
+  W.cNIE.ic.cover<-rep(0,time);W.cNIE.ic.var<-rep(0,time)
+  W.cNIE.tndc.non.cover<-rep(0,time);W.cNIE.tndc.non.var<-rep(0,time)
+  W.cNIE.ic.non.cover<-rep(0,time);W.cNIE.ic.non.var<-rep(0,time)
+
+  W.cNDE.sand<-rep(0,time);cNDE.sand<-rep(0,time)
+  W.cNIE.sand<-rep(0,time);cNIE.sand<-rep(0,time)
+  W.I.cNIE.sand<-rep(0,time);I.cNIE.sand<-rep(0,time)
+  
+  W.cNDE.sand.cover<-rep(0,time);cNDE.sand.cover<-rep(0,time)
+  W.cNIE.sand.cover<-rep(0,time);cNIE.sand.cover<-rep(0,time);
+  W.I.cNIE.sand.cover<-rep(0,time);I.cNIE.sand.cover<-rep(0,time);
+  
+  cCDE.cover<-rep(0,time);W.cCDE.cover<-rep(0,time);
+  W.cCDE.var<-rep(0,time);cCDE.var<-rep(0,time)
+  
+  
+  all<-data.gen.post.rand(popsize=pops)
+  
+  #coinfection rate
+  coinf<-nrow(all[all$I1==1&all$I0==1,])/pops
+  cosymp<-nrow(all[all$W1==1&all$W0==1,])/pops
+  coinf.s<-rep(0,time)
+  cosymp.s<-rep(0,time)
+  
+  #derive mediator
+  all$M<-all$I1*all$W1
+  all$W.M<-all$I1*all$W
+  
+
+    for (i in 1:time){
+    #TND data, only those seeking for medical care
+    all.TND<-subset(all,H==1)
+    #randomly select samples from TND population
+    TND<-all.TND[sample(nrow(all.TND),min(tnd,nrow(all.TND))),]
+    #coinfection rate within samples
+    coinf.s[i]<-nrow(TND[TND$I1==1&TND$I0==1,])/nrow(TND)
+    cosymp.s[i]<-nrow(TND[TND$W1==1&TND$W0==1,])/nrow(TND)
+    
+    #######TND Estimators#########
+    #cNDE
+    #logistic regression for outcome model P(Y=1|M,V,L,W)
+    out.model<-glm(Y~L1+L2+L3+V+M+V*L1+V*L2+V*L3,data=TND,family="binomial"(link = "logit"))
+    newdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1,M=1)
+    newdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0,M=1)
+    pred1<-predict(out.model,newdata=newdat1,type="response")
+    pred0<-predict(out.model,newdata=newdat0,type="response")
+    cNDE[i]<-pred1/pred0
+
+    #W is used to define M
+    #cNDE
+    #logistic regression for outcome model P(Y=1|M,V,L,W)
+    out.model<-glm(Y~L1+L2+L3+V+W.M+V*L1+V*L2+V*L3,data=TND,family="binomial"(link = "logit"))
+    wnewdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1,W.M=1)
+    wnewdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0,W.M=1)
+    wpred1<-predict(out.model,newdata=wnewdat1,type="response")
+    wpred0<-predict(out.model,newdata=wnewdat0,type="response")
+    W.cNDE[i]<-wpred1/wpred0
+    
+    #cCDE on OR
+    cCDE[i]<-(pred1/(1-pred1))/(pred0/(1-pred0))
+    W.cCDE[i]<-(wpred1/(1-wpred1))/(wpred0/(1-wpred0))
+    
+    #cNIE
+    #logistic regression for mediator model P(M=1|V,L,W)
+    mediator.model<-glm(M~V+L1+L2+L3+V*L1+V*L2+V*L3,data=TND,family="binomial"(link = "logit"))
+    mdat1<-data.frame(L1=l1,L2=l2,L3=l3,V=1)
+    mdat0<-data.frame(L1=l1,L2=l2,L3=l3,V=0)
+    mpred1<-predict(mediator.model,newdata=mdat1,type="response")
+    mpred0<-predict(mediator.model,newdata=mdat0,type="response")
+    cNIE.TND[i]<-mpred1/mpred0
+    #2 ratios
+    #ps ratio
+    ps.model<-glm(V~L1+L2+L3,data=TND,family="binomial"(link = "logit"))
+    vdat<-data.frame(L1=l1,L2=l2,L3=l3)
+    vpred<-predict(ps.model,newdata=vdat,type="response")
+    ratio.ps<-vpred/(1-vpred)
+    #ideal control
+    TND.ic<-subset(TND,TND$I0==1&TND$W0==1)
+    ps.ic.model<-glm(V~L1+L2+L3,data=TND.ic,family="binomial"(link = "logit"))
+    ps.ic.pred<-predict(ps.ic.model,newdata=vdat,type="response")
+    ratio.ps.ic<-ps.ic.pred/(1-ps.ic.pred)
+    #TND control
+    TND.c<-subset(TND,TND$I1!=1)
+    ps.c.model<-glm(V~L1+L2+L3,data=TND.c,family="binomial"(link = "logit"))
+    ps.c.pred<-predict(ps.c.model,newdata=vdat,type="response")
+    ratio.ps.c<-ps.c.pred/(1-ps.c.pred)
+    
+    cNIE.ic[i]<-cNIE.TND[i]*ratio.ps/ratio.ps.ic
+    cNIE.tndc[i]<-cNIE.TND[i]*ratio.ps/ratio.ps.c
+    
+    
+    #Only W is observable
+    #logistic regression for mediator model P(M=1|V,L,W)
+    mediator.model<-glm(W.M~V+L1+L2+L3+V*L1+V*L2+V*L3,data=TND,family="binomial"(link = "logit"))
+    med.pred1<-predict(mediator.model,newdata=mdat1,type="response")
+    med.pred0<-predict(mediator.model,newdata=mdat0,type="response")
+    W.cNIE.TND[i]<-med.pred1/med.pred0
+    
+    W.cNIE.ic[i]<-W.cNIE.TND[i]*ratio.ps/ratio.ps.ic
+    W.cNIE.tndc[i]<-W.cNIE.TND[i]*ratio.ps/ratio.ps.c
+    
+    
+    ############################Bootstrap################################
+    outvar<-bvar(loop=boots,dat=TND,l1=l1,l2=l2,l3=l3)
+    
+    #Coverage rate
+    L.cNDE.s<-quantile(outvar$cNDE.s,0.025);U.cNDE.s<-quantile(outvar$cNDE.s,0.975);
+    cNDE.cover[i]<-ifelse(L.cNDE.s<=T.cNDE&T.cNDE<=U.cNDE.s,1,0)
+    
+    L.cNDE.non.s<-quantile(outvar$cNDE.non.s,0.025);U.cNDE.non.s<-quantile(outvar$cNDE.non.s,0.975);
+    W.cNDE.non.cover[i]<-ifelse(L.cNDE.non.s<=T.cNDE&T.cNDE<=U.cNDE.non.s,1,0)
+    
+    L.cNIE.tndc.s<-quantile(outvar$cNIE.tndc.s,0.025);U.cNIE.tndc.s<-quantile(outvar$cNIE.tndc.s,0.975);
+    cNIE.tndc.cover[i]<-ifelse(L.cNIE.tndc.s<=T.cNIE&T.cNIE<=U.cNIE.tndc.s,1,0)
+    
+    L.cNIE.ic.s<-quantile(outvar$cNIE.ic.s,0.025);U.cNIE.ic.s<-quantile(outvar$cNIE.ic.s,0.975);
+    cNIE.ic.cover[i]<-ifelse(L.cNIE.ic.s<=T.cNIE&T.cNIE<=U.cNIE.ic.s,1,0)
+    
+    L.cNIE.tndc.non.s<-quantile(outvar$cNIE.tndc.non.s,0.025);U.cNIE.tndc.non.s<-quantile(outvar$cNIE.tndc.non.s,0.975);
+    cNIE.tndc.non.cover[i]<-ifelse(L.cNIE.tndc.non.s<=T.cNIE&T.cNIE<=U.cNIE.tndc.non.s,1,0)
+    
+    L.cNIE.ic.non.s<-quantile(outvar$cNIE.ic.non.s,0.025);U.cNIE.ic.non.s<-quantile(outvar$cNIE.ic.non.s,0.975);
+    cNIE.ic.non.cover[i]<-ifelse(L.cNIE.ic.non.s<=T.cNIE&T.cNIE<=U.cNIE.ic.non.s,1,0)
+    
+    L.W.cNDE.s<-quantile(outvar$W.cNDE.s,0.025);U.W.cNDE.s<-quantile(outvar$W.cNDE.s,0.975);
+    W.cNDE.cover[i]<-ifelse(L.W.cNDE.s<=T.cNDE&T.cNDE<=U.W.cNDE.s,1,0)
+    
+    L.W.cNDE.non.s<-quantile(outvar$W.cNDE.non.s,0.025);U.W.cNDE.non.s<-quantile(outvar$W.cNDE.non.s,0.975);
+    W.cNDE.non.cover[i]<-ifelse(L.W.cNDE.non.s<=T.cNDE&T.cNDE<=U.W.cNDE.non.s,1,0)
+    
+    L.W.cNIE.tndc.s<-quantile(outvar$W.cNIE.tndc.s,0.025);U.W.cNIE.tndc.s<-quantile(outvar$W.cNIE.tndc.s,0.975);
+    W.cNIE.tndc.cover[i]<-ifelse(L.W.cNIE.tndc.s<=T.cNIE&T.cNIE<=U.W.cNIE.tndc.s,1,0)
+    
+    L.W.cNIE.ic.s<-quantile(outvar$W.cNIE.ic.s,0.025);U.W.cNIE.ic.s<-quantile(outvar$W.cNIE.ic.s,0.975);
+    W.cNIE.ic.cover[i]<-ifelse(L.W.cNIE.ic.s<=T.cNIE&T.cNIE<=U.W.cNIE.ic.s,1,0)
+    
+    L.W.cNIE.tndc.non.s<-quantile(outvar$W.cNIE.tndc.non.s,0.025);U.W.cNIE.tndc.non.s<-quantile(outvar$W.cNIE.tndc.non.s,0.975);
+    W.cNIE.tndc.non.cover[i]<-ifelse(L.W.cNIE.tndc.non.s<=T.cNIE&T.cNIE<=U.W.cNIE.tndc.non.s,1,0)
+    
+    L.W.cNIE.ic.non.s<-quantile(outvar$W.cNIE.ic.non.s,0.025);U.W.cNIE.ic.non.s<-quantile(outvar$W.cNIE.ic.non.s,0.975);
+    W.cNIE.ic.non.cover[i]<-ifelse(L.W.cNIE.ic.non.s<=T.cNIE&T.cNIE<=U.W.cNIE.ic.non.s,1,0)
+    
+    L.W.cCDE.s<-quantile(outvar$W.cCDE.s,0.025);U.W.cCDE.s<-quantile(outvar$W.cCDE.s,0.975);
+    W.cCDE.cover[i]<-ifelse(L.W.cCDE.s<=T.cCDE&T.cCDE<=U.W.cCDE.s,1,0)
+    L.cCDE.s<-quantile(outvar$cCDE.s,0.025);U.cCDE.s<-quantile(outvar$cCDE.s,0.975);
+    cCDE.cover[i]<-ifelse(L.cCDE.s<=T.cCDE&T.cCDE<=U.cCDE.s,1,0)
+    
+    
+    
+    #variance estimate
+    cNDE.var[i]<-var(outvar$cNDE.s)
+    cNDE.non.var[i]<-var(outvar$cNDE.non.s)
+    cNIE.tndc.var[i]<-var(outvar$cNIE.tndc.s)
+    cNIE.ic.var[i]<-var(outvar$cNIE.ic.s)
+    cNIE.tndc.non.var[i]<-var(outvar$cNIE.tndc.non.s)
+    cNIE.ic.non.var[i]<-var(outvar$cNIE.ic.non.s)
+    W.cNDE.var[i]<-var(outvar$W.cNDE.s)
+    W.cNDE.non.var[i]<-var(outvar$W.cNDE.non.s)
+    W.cNIE.tndc.var[i]<-var(outvar$W.cNIE.tndc.s)
+    W.cNIE.ic.var[i]<-var(outvar$W.cNIE.ic.s)
+    W.cNIE.tndc.non.var[i]<-var(outvar$W.cNIE.tndc.non.s)
+    W.cNIE.ic.non.var[i]<-var(outvar$W.cNIE.ic.non.s)
+    cCDE.var[i]<-var(outvar$cCDE.s)
+    W.cCDE.var[i]<-var(outvar$W.cCDE.s)
+    
+    ############################Sandwich################################
+    ###cNDE###
+    cNDE.sw<-cNDE_sandwich(data=TND,newdata=wnewdat1,W=TRUE)
+    W.cNDE.sand[i]<-cNDE.sw$cNDE.var
+    cNDE.sw2<-cNDE_sandwich(data=TND,newdata=newdat1,W=FALSE)
+    cNDE.sand[i]<-cNDE.sw2$cNDE.var
+    #coverage
+    W.cNDE.L<-W.cNDE[i]-1.96*sqrt(W.cNDE.sand[i]);W.cNDE.U<-W.cNDE[i]+1.96*sqrt(W.cNDE.sand[i])
+    W.cNDE.sand.cover[i]<-ifelse(W.cNDE.L<=T.cNDE&T.cNDE<=W.cNDE.U,1,0)
+    cNDE.L<-cNDE[i]-1.96*sqrt(cNDE.sand[i]);cNDE.U<-cNDE[i]+1.96*sqrt(cNDE.sand[i])
+    cNDE.sand.cover[i]<-ifelse(cNDE.L<=T.cNDE&T.cNDE<=cNDE.U,1,0)
+    
+    
+    ###cNIE###
+    cNIE.sw<-cNIE_sandwich(data=TND,newdata=mdat1,IC=FALSE,W=TRUE)
+    W.cNIE.sand[i]<-cNIE.sw$cNIE.var
+    cNIE.sw2<-cNIE_sandwich(data=TND,newdata=mdat1,IC=FALSE,W=FALSE)
+    cNIE.sand[i]<-cNIE.sw2$cNIE.var
+    cNIE.sw3<-cNIE_sandwich(data=TND,newdata=mdat1,IC=TRUE,W=TRUE)
+    W.I.cNIE.sand[i]<-cNIE.sw3$cNIE.var
+    cNIE.sw4<-cNIE_sandwich(data=TND,newdata=mdat1,IC=TRUE,W=FALSE)
+    I.cNIE.sand[i]<-cNIE.sw4$cNIE.var
+    #coverage
+    W.cNIE.L<-W.cNIE.tndc[i]-1.96*sqrt(W.cNIE.sand[i]);W.cNIE.U<-W.cNIE.tndc[i]+1.96*sqrt(W.cNIE.sand[i])
+    W.cNIE.sand.cover[i]<-ifelse(W.cNIE.L<=T.cNIE&T.cNIE<=W.cNIE.U,1,0)
+    
+    cNIE.L<-cNIE.tndc[i]-1.96*sqrt(cNIE.sand[i]);cNIE.U<-cNIE.tndc[i]+1.96*sqrt(cNIE.sand[i])
+    cNIE.sand.cover[i]<-ifelse(cNIE.L<=T.cNIE&T.cNIE<=cNIE.U,1,0)
+    
+    W.I.cNIE.L<-W.cNIE.ic[i]-1.96*sqrt(W.I.cNIE.sand[i]);W.I.cNIE.U<-W.cNIE.ic[i]+1.96*sqrt(W.I.cNIE.sand[i])
+    W.I.cNIE.sand.cover[i]<-ifelse(W.I.cNIE.L<=T.cNIE&T.cNIE<=W.I.cNIE.U,1,0)
+    
+    I.cNIE.L<-cNIE.ic[i]-1.96*sqrt(I.cNIE.sand[i]);I.cNIE.U<-cNIE.ic[i]+1.96*sqrt(I.cNIE.sand[i])
+    I.cNIE.sand.cover[i]<-ifelse(I.cNIE.L<=T.cNIE&T.cNIE<=I.cNIE.U,1,0)
+  }
+  
+  out<-list("cNDE"=cNDE,
+            "cNIE.tndc"=cNIE.tndc,"cNIE.ic"=cNIE.ic,
+            "W.cNDE"=W.cNDE,
+            "W.cNIE.tndc"=W.cNIE.tndc,"W.cNIE.ic"=W.cNIE.ic,
+            "cCDE"=cCDE,"W.cCDE"=W.cCDE,
+            "coinf"=coinf,"coinf.s"=coinf.s,"cosymp"=cosymp,"cosymp.s"=cosymp.s,
+            "cNDE.var"=cNDE.var,"cNDE.non.var"=cNDE.non.var,
+            "cNIE.tndc.var"=cNIE.tndc.var,"cNIE.ic.var"=cNIE.ic.var,
+            "cNIE.tndc.non.var"=cNIE.tndc.non.var,"cNIE.ic.non.var"=cNIE.ic.non.var,
+            "W.cNDE.var"=W.cNDE.var,"W.cNDE.non.var"=W.cNDE.non.var,
+            "W.cNIE.tndc.var"=W.cNIE.tndc.var,"W.cNIE.ic.var"=W.cNIE.ic.var,
+            "W.cNIE.tndc.non.var"=W.cNIE.tndc.non.var,"W.cNIE.ic.non.var"=W.cNIE.ic.non.var,
+            "cNDE.cover"=cNDE.cover,
+            "cNIE.tndc.cover"=cNIE.tndc.cover,"cNIE.ic.cover"=cNIE.ic.cover,
+            "W.cNDE.cover"=W.cNDE.cover,
+            "W.cNIE.tndc.cover"=W.cNIE.tndc.cover,"W.cNIE.ic.cover"=W.cNIE.ic.cover,
+            "cNDE.sand"=cNDE.sand,"W.cNDE.sand"=W.cNDE.sand,
+            "W.cNDE.sand.cover"=W.cNDE.sand.cover,"cNDE.sand.cover"=cNDE.sand.cover,
+            "cNIE.sand"=cNIE.sand,"W.cNIE.sand"=W.cNIE.sand,"W.I.cNIE.sand"=W.I.cNIE.sand,"I.cNIE.sand"=I.cNIE.sand,
+            "W.cNIE.sand.cover"=W.cNIE.sand.cover,"cNIE.sand.cover"=cNIE.sand.cover,
+            "W.I.cNIE.sand.cover"=W.I.cNIE.sand.cover,"I.cNIE.sand.cover"=I.cNIE.sand.cover,
+            "cCDE.cover"=cCDE.cover,"cCDE.var"=cCDE.var,
+            "W.cCDE.cover"=W.cCDE.cover,"W.cCDE.var"=W.cCDE.var
+            )
+  return(out)
+}
+
+
+set.seed(100)
+out<-EST.post.rand(time=1000,pops=8000000,tnd=20000,boots=500,l1=0,l2=0.5,l3=0,T.cNDE=0.7104251,T.cNIE=0.02738751,T.cCDE=0.4991239)
+out.dat<-data.frame("cNDE"=out$cNDE,
+                    "cNIE.tndc"=out$cNIE.tndc,"cNIE.ic"=out$cNIE.ic,
+                    "W.cNDE"=out$W.cNDE,
+                    "W.cNIE.tndc"=out$W.cNIE.tndc,"W.cNIE.ic"=out$W.cNIE.ic,
+                    
+                    "cNDE.var.sand"=out$cNDE.sand,"cNDE.cover.sand"=out$cNDE.sand.cover,
+                    "cNIE.var.sand"=out$cNIE.sand,"cNIE.cover.sand"=out$cNIE.sand.cover,
+                    "I.cNIE.var.sand"=out$I.cNIE.sand,"I.cNIE.cover.sand"=out$I.cNIE.sand.cover,
+                    "cNDE.var"=out$cNDE.var,"cNDE.cover"=out$cNDE.cover,
+                    "cNIE.var"=out$cNIE.tndc.var,"cNIE.cover"=out$cNIE.tndc.cover,
+                    "I.cNIE.var"=out$cNIE.ic.var,"I.cNIE.cover"=out$cNIE.ic.cover,
+                   
+                    "W.cNDE.var.sand"=out$W.cNDE.sand,"W.cNDE.sand.cover"=out$W.cNDE.sand.cover,
+                    "W.cNIE.var.sand"=out$W.cNIE.sand,"W.cNIE.sand.cover"=out$W.cNIE.sand.cover,
+                    "W.I.cNIE.var.sand"=out$W.I.cNIE.sand,"W.I.cNIE.sand.cover"=out$W.I.cNIE.sand.cover,
+                    
+                    "W.cNDE.var"=out$W.cNDE.var,"W.cNDE.cover"=out$W.cNDE.cover,
+                    "W.cNIE.var"=out$W.cNIE.tndc.var,"W.cNIE.cover"=out$W.cNIE.tndc.cover,
+                    "W.I.cNIE.var"=out$W.cNIE.ic.var,"W.I.cNIE.cover"=out$W.cNIE.ic.cover,
+                   
+                    "cCDE"=out$cCDE,
+                    "cCDE.var"=out$cCDE.var,"cCDE.cover"=out$cCDE.cover,
+                    "W.cCDE"=out$W.cCDE,
+                    "W.cCDE.var"=out$W.cCDE.var,"W.cCDE.cover"=out$W.cCDE.cover,
+                    "coinf"=out$coinf,"coinf.s"=out$coinf.s,"cosymp"=out$cosymp,"cosymp.s"=out$cosymp.s
+)
+
+write.csv(out.dat,"output.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
